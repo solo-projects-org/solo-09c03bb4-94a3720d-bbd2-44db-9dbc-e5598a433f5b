@@ -14,6 +14,12 @@ services:
       # Sample Parquet files, the "seeded" marker and the SQLite DB all live
       # on this volume, so deletions and retirement state survive restarts.
       - cleanup-data:/app/data
+      # The local manifest is a bind mount.  Edit the host file (remove the
+      # retired entry) and every request reads the new content immediately;
+      # a container restart also works.
+      - ./manifest.json:/app/manifest.json:ro
+      # The pre/post-upgrade manifest snapshots used in the README demo.
+      - ./manifests:/app/manifests:ro
     healthcheck:
       test:
         - CMD

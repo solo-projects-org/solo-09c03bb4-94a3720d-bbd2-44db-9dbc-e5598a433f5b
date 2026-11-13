@@ -33,6 +33,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     ensure_db(settings.db_path)
     if settings.seed_on_start:
         seed_sample_data(settings.sample_data_dir, settings.data_dir)
+    # Upgrade path: retirements recorded by older builds only stored the
+    # snapshot id.  Backfill their file lists from the startup manifest so
+    # they remain reclaimable after the entries are removed.
+    service.backfill_retirement_files(settings)
     yield
 
 

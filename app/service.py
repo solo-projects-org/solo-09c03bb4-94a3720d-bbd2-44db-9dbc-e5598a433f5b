@@ -7,9 +7,16 @@ Safety rules implemented here:
 * Retirement only stops *future* registrations.  Registrations that already
   committed keep protecting their snapshot's files until they are released,
   even if retirement happens concurrently.
+* Retirement persists the snapshot's file list.  Operators remove the
+  snapshot entry from the local manifest afterwards; cleanup still knows
+  which files retirement made unreferenced, even after a restart and even
+  when no export registration ever captured them.
 * Cleanup computes the deletable set and performs unlinks while holding
   SQLite's write lock, so a registration cannot commit in between the
   decision and the deletion.
+* Cleanup only considers files whose ownership it can prove: the union of
+  the current manifest, persisted retirement file lists, and active export
+  file lists.  Other files on the data volume are never touched.
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ from typing import Any
 
 from .config import Settings
 from .db import begin_immediate, connect, ensure_db
-from .manifest import Manifest, load_manifest
+from .manifest import Manifest, ManifestError, load_manifest, normalize_rel_path
 
 
 class SnapshotNotFound(Exception):
@@ -54,6 +61,47 @@ def _retired_map(connection: sqlite3.Connection) -> dict[str, str]:
     return {row["snapshot_id"]: row["retired_at"] for row in rows}
 
 
+def _safe_persisted_files(files_json: Any) -> list[str]:
+    """Parse a persisted file list, keeping only paths that are safe to unlink."""
+
+    try:
+        files = json.loads(files_json)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(files, list):
+        return []
+    safe: list[str] = []
+    for item in files:
+        if not isinstance(item, str):
+            continue
+        try:
+            normalized = normalize_rel_path(item)
+        except ManifestError:
+            # A corrupt/unsafe stored path is ignored rather than allowed to
+            # reach the filesystem.
+            continue
+        if normalized not in safe:
+            safe.append(normalized)
+    return safe
+
+
+def _retirement_files(connection: sqlite3.Connection) -> dict[str, list[str]]:
+    """Persisted file lists of every retirement, keyed by snapshot id.
+
+    Rows written by older builds may have a NULL ``files_json``; they are
+    backfilled at startup, and are simply treated as an empty list here.
+    """
+
+    rows = connection.execute(
+        "SELECT snapshot_id, files_json FROM snapshot_retirements "
+        "ORDER BY retired_at, snapshot_id"
+    ).fetchall()
+    return {
+        row["snapshot_id"]: _safe_persisted_files(row["files_json"])
+        for row in rows
+    }
+
+
 def _active_exports(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
@@ -65,18 +113,12 @@ def _active_exports(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     ).fetchall()
     exports: list[dict[str, Any]] = []
     for row in rows:
-        try:
-            files = json.loads(row["files_json"])
-            if not isinstance(files, list):
-                files = []
-        except (TypeError, ValueError):
-            files = []
         exports.append(
             {
                 "registration_id": row["registration_id"],
                 "snapshot_id": row["snapshot_id"],
                 "export_id": row["export_id"],
-                "files": files,
+                "files": _safe_persisted_files(row["files_json"]),
                 "registered_at": row["registered_at"],
             }
         )
@@ -127,16 +169,33 @@ def retire_snapshot(settings: Settings, snapshot_id: str) -> dict[str, Any]:
     if snapshot_id not in manifest.snapshots:
         raise SnapshotNotFound(snapshot_id)
 
+    # Capture the file list at retirement time.  The manifest entry is
+    # expected to be removed afterwards; without this list cleanup would no
+    # longer know which files to reclaim.
+    files = list(manifest.snapshots[snapshot_id].files)
+    files_json = json.dumps(files, ensure_ascii=False)
+
     ensure_db(settings.db_path)
     with connect(settings.db_path) as connection:
         begin_immediate(connection)
         try:
             row = connection.execute(
-                "SELECT retired_at FROM snapshot_retirements WHERE snapshot_id = ?",
+                "SELECT retired_at, files_json FROM snapshot_retirements "
+                "WHERE snapshot_id = ?",
                 (snapshot_id,),
             ).fetchone()
             if row is not None:
-                connection.commit()
+                # A retirement written by an older build has no file list;
+                # backfill it while the manifest still has the entry.
+                if row["files_json"] is None:
+                    connection.execute(
+                        "UPDATE snapshot_retirements SET files_json = ? "
+                        "WHERE snapshot_id = ?",
+                        (files_json, snapshot_id),
+                    )
+                    connection.commit()
+                else:
+                    connection.commit()
                 return {
                     "snapshot_id": snapshot_id,
                     "retired": True,
@@ -146,8 +205,9 @@ def retire_snapshot(settings: Settings, snapshot_id: str) -> dict[str, Any]:
 
             retired_at = _now()
             connection.execute(
-                "INSERT INTO snapshot_retirements (snapshot_id, retired_at) VALUES (?, ?)",
-                (snapshot_id, retired_at),
+                "INSERT INTO snapshot_retirements "
+                "(snapshot_id, retired_at, files_json) VALUES (?, ?, ?)",
+                (snapshot_id, retired_at, files_json),
             )
             connection.commit()
             return {
@@ -159,6 +219,53 @@ def retire_snapshot(settings: Settings, snapshot_id: str) -> dict[str, Any]:
         except Exception:
             connection.rollback()
             raise
+
+
+def backfill_retirement_files(settings: Settings) -> int:
+    """Fill in file lists for retirements persisted by older builds.
+
+    Cleanup after an upgrade must still reclaim files from retirements that
+    were recorded before ``files_json`` existed.  Those rows are matched
+    against the startup manifest, which still contains the old entries in an
+    in-place upgrade.  Retirements whose snapshot is already gone from the
+    manifest stay without a file list and therefore own no files (their disk
+    files are never guessed at).
+    """
+
+    ensure_db(settings.db_path)
+    try:
+        manifest = _manifest(settings)
+    except ManifestError:
+        # A malformed/missing manifest must not prevent the service from
+        # starting; cleanup will surface the error on request.
+        return 0
+
+    updated = 0
+    with connect(settings.db_path) as connection:
+        begin_immediate(connection)
+        try:
+            rows = connection.execute(
+                "SELECT snapshot_id, files_json FROM snapshot_retirements "
+                "WHERE files_json IS NULL"
+            ).fetchall()
+            for row in rows:
+                snapshot = manifest.snapshots.get(row["snapshot_id"])
+                if snapshot is None:
+                    continue
+                connection.execute(
+                    "UPDATE snapshot_retirements SET files_json = ? "
+                    "WHERE snapshot_id = ?",
+                    (
+                        json.dumps(list(snapshot.files), ensure_ascii=False),
+                        row["snapshot_id"],
+                    ),
+                )
+                updated += 1
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return updated
 
 
 def register_export(
@@ -285,18 +392,12 @@ def list_exports(settings: Settings, active_only: bool = True) -> list[dict[str,
 
     exports = []
     for row in rows:
-        try:
-            files = json.loads(row["files_json"])
-            if not isinstance(files, list):
-                files = []
-        except (TypeError, ValueError):
-            files = []
         exports.append(
             {
                 "registration_id": row["registration_id"],
                 "snapshot_id": row["snapshot_id"],
                 "export_id": row["export_id"],
-                "files": files,
+                "files": _safe_persisted_files(row["files_json"]),
                 "registered_at": row["registered_at"],
                 "released_at": row["released_at"],
                 "active": row["released_at"] is None,
@@ -318,6 +419,7 @@ def _build_plan(
     connection: sqlite3.Connection, manifest: Manifest, data_dir: Path
 ) -> dict[str, Any]:
     retired = _retired_map(connection)
+    retirement_files = _retirement_files(connection)
     active_exports = _active_exports(connection)
 
     retained_files: set[str] = set()
@@ -329,9 +431,25 @@ def _build_plan(
     for export in active_exports:
         export_files.update(export["files"])
 
+    # Ownership is only claimed for files we can actually attribute:
+    # the current manifest, the file lists persisted by retirement, and
+    # active export registrations.  Nothing else on the data volume is ever
+    # considered, so an unknown on-disk file can never be deleted.
+    known_files: list[str] = list(manifest.all_files)
+    seen_known = set(known_files)
+    for files in retirement_files.values():
+        for file_path in files:
+            if file_path not in seen_known:
+                seen_known.add(file_path)
+                known_files.append(file_path)
+    for file_path in sorted(export_files):
+        if file_path not in seen_known:
+            seen_known.add(file_path)
+            known_files.append(file_path)
+
     eligible = [
         file_path
-        for file_path in manifest.all_files
+        for file_path in known_files
         if file_path not in retained_files and file_path not in export_files
     ]
     deletable = [
@@ -341,14 +459,14 @@ def _build_plan(
         file_path for file_path in eligible if not _file_present(data_dir, file_path)
     ]
     protected_by_retained = [
-        file_path for file_path in manifest.all_files if file_path in retained_files
+        file_path for file_path in known_files if file_path in retained_files
     ]
     protected_by_exports = [
-        file_path for file_path in manifest.all_files if file_path in export_files
+        file_path for file_path in known_files if file_path in export_files
     ]
     protected = [
         file_path
-        for file_path in manifest.all_files
+        for file_path in known_files
         if file_path in retained_files or file_path in export_files
     ]
 

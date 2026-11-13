@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -253,6 +254,255 @@ class CleanupServiceTests(unittest.TestCase):
         self.assertEqual(second["deleted"], [])
         self.assertEqual(second["already_absent"], ["a.parquet"])
         self.assertEqual(second["failed"], [])
+
+
+class ManifestRemovalTests(unittest.TestCase):
+    """Retirement, not the manifest, must remember the files it orphaned."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.data_dir = self.root / "data"
+        self.data_dir.mkdir()
+        self.manifest_path = self.root / "manifest.json"
+        self.db_path = self.root / "state" / "cleanup.db"
+        db.reset_initialization_cache()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def settings(self) -> Settings:
+        return Settings(
+            manifest_path=self.manifest_path,
+            data_dir=self.data_dir,
+            db_path=self.db_path,
+            sample_data_dir=self.root / "samples",
+            seed_on_start=False,
+        )
+
+    def write_manifest(self, snapshots: list[dict]) -> None:
+        self.manifest_path.write_text(
+            json.dumps({"snapshots": snapshots}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def touch(self, *paths: str) -> None:
+        for relative in paths:
+            target = self.data_dir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"PAR1-demo-PAR1")
+
+    def exists(self, relative: str) -> bool:
+        return (self.data_dir / relative).exists()
+
+    def test_files_remain_reclaimable_after_manifest_entry_removed(self) -> None:
+        self.write_manifest(
+            [
+                {
+                    "snapshot_id": "snap-a",
+                    "files": ["a.parquet", "shared.parquet"],
+                },
+                {"snapshot_id": "snap-b", "files": ["b.parquet"]},
+            ]
+        )
+        self.touch("a.parquet", "b.parquet", "shared.parquet")
+        db.reset_initialization_cache()
+
+        # Retire before any export registration ever existed.
+        service.retire_snapshot(self.settings(), "snap-a")
+        self.assertEqual(
+            service.preview_cleanup(self.settings())["deletable"],
+            ["a.parquet", "shared.parquet"],
+        )
+
+        # Operator removes the retired entry from the local manifest and
+        # the service restarts.
+        self.write_manifest([{"snapshot_id": "snap-b", "files": ["b.parquet"]}])
+        db.reset_initialization_cache()
+
+        preview = service.preview_cleanup(self.settings())
+        self.assertEqual(preview["deletable"], ["a.parquet", "shared.parquet"])
+        self.assertEqual(preview["protected_by_retained_snapshots"], ["b.parquet"])
+
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], ["a.parquet", "shared.parquet"])
+        self.assertEqual(result["failed"], [])
+        self.assertFalse(self.exists("a.parquet"))
+        self.assertTrue(self.exists("b.parquet"))
+
+        # Idempotent after the files are gone.
+        second = service.run_cleanup(self.settings())
+        self.assertEqual(second["deleted"], [])
+        self.assertEqual(
+            second["already_absent"], ["a.parquet", "shared.parquet"]
+        )
+
+    def test_shared_file_survives_while_a_retained_snapshot_lists_it(self) -> None:
+        self.write_manifest(
+            [
+                {"snapshot_id": "snap-a", "files": ["a.parquet", "shared.parquet"]},
+                {"snapshot_id": "snap-b", "files": ["b.parquet", "shared.parquet"]},
+            ]
+        )
+        self.touch("a.parquet", "b.parquet", "shared.parquet")
+        service.retire_snapshot(self.settings(), "snap-a")
+        service.retire_snapshot(self.settings(), "snap-b")
+
+        # Remove both retired entries and add a retained snapshot that still
+        # references the shared file.  b.parquet was listed by the retired
+        # snap-b, so it stays reclaimable; shared.parquet is now retained.
+        self.write_manifest(
+            [
+                {"snapshot_id": "snap-c", "files": ["shared.parquet"]},
+            ]
+        )
+        db.reset_initialization_cache()
+
+        preview = service.preview_cleanup(self.settings())
+        self.assertNotIn("shared.parquet", preview["deletable"])
+        self.assertIn("shared.parquet", preview["protected_by_retained_snapshots"])
+        self.assertEqual(preview["deletable"], ["a.parquet", "b.parquet"])
+
+        service.run_cleanup(self.settings())
+        self.assertTrue(self.exists("shared.parquet"))
+
+    def test_active_export_still_protects_files_after_manifest_removal(self) -> None:
+        self.write_manifest(
+            [{"snapshot_id": "snap-a", "files": ["a.parquet", "shared.parquet"]}]
+        )
+        self.touch("a.parquet", "shared.parquet")
+        registration = service.register_export(self.settings(), "snap-a", "exp-1")
+        service.retire_snapshot(self.settings(), "snap-a")
+        self.write_manifest([])
+        db.reset_initialization_cache()
+
+        preview = service.preview_cleanup(self.settings())
+        self.assertEqual(preview["deletable"], [])
+        self.assertEqual(
+            preview["protected_by_active_exports"],
+            ["a.parquet", "shared.parquet"],
+        )
+
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], [])
+        self.assertTrue(self.exists("a.parquet"))
+        self.assertTrue(self.exists("shared.parquet"))
+
+        service.release_export(self.settings(), registration["registration_id"])
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], ["a.parquet", "shared.parquet"])
+
+    def test_unknown_files_on_disk_are_never_deleted(self) -> None:
+        self.write_manifest(
+            [{"snapshot_id": "snap-a", "files": ["a.parquet"]}]
+        )
+        self.touch("a.parquet", "orphan.parquet", "hydro/unknown.parquet")
+        service.retire_snapshot(self.settings(), "snap-a")
+
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], ["a.parquet"])
+        self.assertTrue(self.exists("orphan.parquet"))
+        self.assertTrue(self.exists("hydro/unknown.parquet"))
+
+    def test_failed_deletion_is_retried_after_manifest_removal_and_restart(
+        self,
+    ) -> None:
+        self.write_manifest(
+            [{"snapshot_id": "snap-a", "files": ["a.parquet", "b.parquet"]}]
+        )
+        self.touch("b.parquet")
+        target = self.data_dir / "a.parquet"
+        target.mkdir(parents=True)  # a directory makes unlink() fail
+
+        service.retire_snapshot(self.settings(), "snap-a")
+        self.write_manifest([])
+        db.reset_initialization_cache()
+
+        first = service.run_cleanup(self.settings())
+        self.assertEqual(first["deleted"], ["b.parquet"])
+        self.assertEqual(first["failed"], ["a.parquet"])
+        self.assertEqual(len(first["failures"]), 1)
+
+        # The failure did not lose the retirement's file list.
+        target.rmdir()
+        target.write_bytes(b"PAR1-PAR1")
+        db.reset_initialization_cache()
+        second = service.run_cleanup(self.settings())
+        self.assertEqual(second["deleted"], ["a.parquet"])
+        self.assertEqual(second["failed"], [])
+
+    def test_retirement_files_are_backfilled_for_legacy_rows(self) -> None:
+        self.write_manifest(
+            [
+                {"snapshot_id": "snap-old", "files": ["old.parquet"]},
+                {"snapshot_id": "snap-new", "files": ["new.parquet"]},
+            ]
+        )
+        self.touch("old.parquet", "new.parquet")
+
+        # Simulate a database written by an older build (no files_json).
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                "CREATE TABLE snapshot_retirements ("
+                "snapshot_id TEXT PRIMARY KEY, retired_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO snapshot_retirements VALUES ('snap-old', '2026-11-01T00:00:00+00:00')"
+            )
+            connection.execute(
+                "INSERT INTO snapshot_retirements VALUES ('snap-gone', '2026-11-01T00:00:00+00:00')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        db.reset_initialization_cache()
+
+        # Startup migration adds the column and backfills from the manifest.
+        added = service.backfill_retirement_files(self.settings())
+        self.assertEqual(added, 1)
+
+        # The old entry is removed from the manifest afterwards.
+        self.write_manifest([{"snapshot_id": "snap-new", "files": ["new.parquet"]}])
+        db.reset_initialization_cache()
+
+        preview = service.preview_cleanup(self.settings())
+        self.assertEqual(preview["deletable"], ["old.parquet"])
+        # The retirement whose snapshot is unknown owns no files, so nothing
+        # can be attributed to it.
+        self.assertTrue(self.exists("new.parquet"))
+
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], ["old.parquet"])
+        self.assertTrue(self.exists("new.parquet"))
+
+    def test_retiring_existing_legacy_row_backfills_files(self) -> None:
+        self.write_manifest([{"snapshot_id": "snap-a", "files": ["a.parquet"]}])
+        self.touch("a.parquet")
+
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                "CREATE TABLE snapshot_retirements ("
+                "snapshot_id TEXT PRIMARY KEY, retired_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO snapshot_retirements VALUES ('snap-a', '2026-11-01T00:00:00+00:00')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        db.reset_initialization_cache()
+
+        response = service.retire_snapshot(self.settings(), "snap-a")
+        self.assertTrue(response["already_retired"])
+        self.write_manifest([])
+        db.reset_initialization_cache()
+
+        result = service.run_cleanup(self.settings())
+        self.assertEqual(result["deleted"], ["a.parquet"])
 
 
 class ManifestTests(unittest.TestCase):

@@ -15,7 +15,9 @@ def _write_manifest(path, snapshots):
 
 
 @pytest.fixture()
-def api(tmp_path, monkeypatch):
+def api_env(tmp_path, monkeypatch):
+    """Like ``api`` but also returns the manifest path for replacement."""
+
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     manifest_path = tmp_path / "manifest.json"
@@ -28,6 +30,8 @@ def api(tmp_path, monkeypatch):
     )
     for name in ("a.parquet", "b.parquet", "shared.parquet"):
         (data_dir / name).write_bytes(b"PAR1-PAR1")
+    # A file nobody knows about must never be reclaimed.
+    (data_dir / "orphan.parquet").write_bytes(b"PAR1-PAR1")
 
     monkeypatch.setenv("MANIFEST_PATH", str(manifest_path))
     monkeypatch.setenv("DATA_DIR", str(data_dir))
@@ -38,7 +42,75 @@ def api(tmp_path, monkeypatch):
     from app.main import app
 
     with TestClient(app) as client:
-        yield client, data_dir
+        yield client, data_dir, manifest_path
+
+
+@pytest.fixture()
+def api(api_env):
+    client, data_dir, _ = api_env
+    yield client, data_dir
+
+
+def test_trimmed_manifest_still_reclaims_retired_files(api_env):
+    client, data_dir, manifest_path = api_env
+
+    assert client.post("/snapshots/a/retire").status_code == 200
+    assert client.post("/snapshots/b/retire").status_code == 200
+
+    # The operator rewrites the whole manifest, dropping both retired entries.
+    _write_manifest(manifest_path, [])
+
+    preview = client.get("/cleanup/preview").json()
+    assert preview["deletable"] == ["a.parquet", "shared.parquet", "b.parquet"]
+    assert (data_dir / "orphan.parquet").exists()
+
+    cleanup = client.post("/cleanup").json()
+    assert cleanup["deleted"] == ["a.parquet", "shared.parquet", "b.parquet"]
+    assert cleanup["failed"] == []
+    assert not (data_dir / "a.parquet").exists()
+    assert (data_dir / "orphan.parquet").exists()
+
+    # Idempotent, and already-absent files stay visible in the response.
+    again = client.post("/cleanup").json()
+    assert again["deleted"] == []
+    assert again["already_absent"] == [
+        "a.parquet",
+        "shared.parquet",
+        "b.parquet",
+    ]
+
+
+def test_trimmed_manifest_reclaims_after_restart_and_release(api_env):
+    client, data_dir, manifest_path = api_env
+
+    registration = client.post(
+        "/exports/register", json={"snapshot_id": "a", "export_id": "export-1"}
+    ).json()["registration_id"]
+    assert client.post("/snapshots/a/retire").status_code == 200
+    _write_manifest(manifest_path, [])
+
+    # Restart the service (new lifespan) with the trimmed manifest.
+    from app.main import app
+
+    with TestClient(app) as restarted:
+        preview = restarted.get("/cleanup/preview").json()
+        assert preview["deletable"] == []
+        assert preview["protected_by_active_exports"] == [
+            "a.parquet",
+            "shared.parquet",
+        ]
+
+        released = restarted.post(f"/exports/{registration}/release")
+        assert released.status_code == 200
+        assert released.json()["already_released"] is False
+
+        result = restarted.post("/cleanup").json()
+        assert result["deleted"] == ["a.parquet", "shared.parquet"]
+        assert result["failed"] == []
+        # The trimmed manifest is empty, so b.parquet is not attributable any
+        # more; nothing besides the retired snapshot's files is touched.
+        assert (data_dir / "b.parquet").exists()
+        assert (data_dir / "orphan.parquet").exists()
 
 
 def test_demo_before_and_after_export_completion(api):

@@ -11,7 +11,8 @@ from typing import Iterator
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshot_retirements (
     snapshot_id TEXT PRIMARY KEY,
-    retired_at  TEXT NOT NULL
+    retired_at  TEXT NOT NULL,
+    files_json  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS export_registrations (
@@ -36,7 +37,7 @@ def _path_key(path: Path) -> str:
 
 
 def ensure_db(path: Path) -> None:
-    """Create the database and schema once per process."""
+    """Create/migrate the database and schema once per process."""
 
     key = _path_key(path)
     with _init_lock:
@@ -49,9 +50,29 @@ def ensure_db(path: Path) -> None:
             connection.execute("PRAGMA busy_timeout=30000")
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            _migrate_retirement_files(connection)
         finally:
             connection.close()
         _initialized_paths.add(key)
+
+
+def _migrate_retirement_files(connection: sqlite3.Connection) -> None:
+    """Add the retirement file snapshot to databases created by older builds.
+
+    Older builds only stored ``snapshot_id``/``retired_at``.  The file list is
+    what lets cleanup find files after the entry is removed from the local
+    manifest, so it has to be persisted at retirement time.  Existing rows are
+    backfilled from the startup manifest (see ``service.backfill_retirement_files``).
+    """
+
+    columns = {
+        row[1]  # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)
+        for row in connection.execute("PRAGMA table_info(snapshot_retirements)")
+    }
+    if "files_json" not in columns:
+        connection.execute(
+            "ALTER TABLE snapshot_retirements ADD COLUMN files_json TEXT"
+        )
 
 
 def reset_initialization_cache() -> None:

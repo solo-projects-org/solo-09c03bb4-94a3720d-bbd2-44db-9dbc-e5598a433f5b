@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY manifest.json ./manifest.json
+COPY manifests ./manifests
 COPY sample_data ./sample_data
 
 EXPOSE 8000

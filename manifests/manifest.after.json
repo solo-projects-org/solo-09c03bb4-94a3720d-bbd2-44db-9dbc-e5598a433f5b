@@ -1,0 +1,12 @@
+{
+  "snapshots": [
+    {
+      "snapshot_id": "snap-20261102-night",
+      "files": [
+        "hydro/2026-11-02/station_a.parquet",
+        "hydro/2026-11-02/station_b.parquet",
+        "hydro/shared/quality.parquet"
+      ]
+    }
+  ]
+}
